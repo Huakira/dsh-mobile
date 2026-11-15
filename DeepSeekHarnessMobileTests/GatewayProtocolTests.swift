@@ -2117,6 +2117,13 @@ final class ConversationViewportLayoutTests: XCTestCase {
             collectionView.cellForItem(at: IndexPath(item: 0, section: 0))
                 as? StreamingAssistantCell
         )
+        // The reveal buffer spreads the burst over frames, so the cell trails
+        // the published text and must catch up on its own.
+        XCTAssertLessThanOrEqual(cell.renderedCharacterCount, text.count)
+        let deadline = Date().addingTimeInterval(8)
+        while cell.renderedCharacterCount < text.count, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
         XCTAssertEqual(cell.renderedCharacterCount, text.count)
         XCTAssertLessThan(
             controller.streamingLayoutInvalidationCount,

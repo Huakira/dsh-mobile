@@ -480,7 +480,16 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
             owner?.prepareNextHistoryHeightBatch(generation: generation)
         }
     }
-    private var streamingHeightMeasurers: [String: StreamingTextHeightMeasurer] = [:]
+    private var streamingDocuments: [String: StreamingMarkdownDocument] = [:]
+    private var revealBuffer = StreamingRevealBuffer()
+    private var lastRenderedSnapshot: ConversationTimeline.Snapshot?
+    private var revealDisplayLink: CADisplayLink?
+    private var streamingTailFade: CGFloat = 0
+
+    private final class RevealTickTarget: NSObject {
+        weak var owner: ConversationViewportController?
+        @MainActor @objc func tick() { owner?.revealTick() }
+    }
     private var pendingLiveHeightCorrections: [CellMeasurementKey: LiveHeightCorrection] = [:]
     private var isLiveHeightCorrectionScheduled = false
     private var pendingDisclosureAnchor: DisclosureAnchor?
@@ -761,6 +770,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
     deinit {
         historyPreparationDisplayLink?.invalidate()
         initialContentRevealDisplayLink?.invalidate()
+        revealDisplayLink?.invalidate()
         let timeline = timeline
         let observerID = timelineObserverID
         Task { @MainActor in
@@ -814,7 +824,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
         preparedPresentation = nil
         configuredBodyFontSize = size
         cellHeightCache = Self.reusableHeights[reusableHeightKey]?.heights ?? [:]
-        streamingHeightMeasurers.removeAll()
+        streamingDocuments.removeAll()
         previousRevisions = [:]
         lastAppliedRevision = -1
         collectionView.collectionViewLayout.invalidateLayout()
@@ -841,9 +851,21 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
         render(snapshot)
     }
 
-    private func render(_ snapshot: ConversationTimeline.Snapshot) {
+    private func streamingDocument(for id: String, text: String) -> StreamingMarkdownDocument {
+        let document = streamingDocuments[id] ?? StreamingMarkdownDocument()
+        streamingDocuments[id] = document
+        document.update(text: text, tailFade: streamingTailFade)
+        return document
+    }
+
+    private func render(_ snapshot: ConversationTimeline.Snapshot, isRevealTick: Bool = false) {
         guard let makeEntries else { return }
-        let entries = supplementalEntries + makeEntries(snapshot.items)
+        lastRenderedSnapshot = snapshot
+        let items = revealBuffer.smoothed(snapshot.items, now: CACurrentMediaTime(), advance: true)
+        streamingTailFade = revealBuffer.tailFade
+        if isRevealTick { lastAppliedRevision = -1 }
+        updateRevealDisplayLink()
+        let entries = supplementalEntries + makeEntries(items)
         let hasContent = !snapshot.items.isEmpty || entries.contains { $0.id == "deep-search-progress" }
         apply(
             entries: entries,
@@ -852,6 +874,44 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
             hasConversationContent: hasContent,
             historyPresentationStamp: snapshot.historyPresentationStamp
         )
+    }
+
+    private func updateRevealDisplayLink() {
+        if revealBuffer.needsTick {
+            guard revealDisplayLink == nil else { return }
+            let target = RevealTickTarget()
+            target.owner = self
+            let link = CADisplayLink(target: target, selector: #selector(RevealTickTarget.tick))
+            link.add(to: .main, forMode: .common)
+            revealDisplayLink = link
+        } else {
+            revealDisplayLink?.invalidate()
+            revealDisplayLink = nil
+        }
+    }
+
+    /// Advances the reveal buffer one frame. While the user is scrolling or a
+    /// snapshot is mid-flight the tick idles; the normal deferred-presentation
+    /// path renders the latest snapshot afterwards.
+    fileprivate func revealTick() {
+        guard let snapshot = lastRenderedSnapshot else { updateRevealDisplayLink(); return }
+        guard !isStreamingRenderingPausedForUserScroll, !isViewportMoving, !isApplyingSnapshot,
+              deferredTimelineSnapshot == nil, pendingApply == nil,
+              historyPreparationDisplayLink == nil,
+              presentationSchedule.permitsWork(at: CACurrentMediaTime()) else { return }
+        render(snapshot, isRevealTick: true)
+        refreshStreamingFade()
+    }
+
+    /// Fade decay does not change text (hence no new entry revision), so push
+    /// the document state to visible cells directly.
+    private func refreshStreamingFade() {
+        for (id, entry) in entriesByID {
+            guard let payload = entry.streamingAssistant,
+                  let indexPath = dataSource.indexPath(for: id),
+                  let cell = collectionView.cellForItem(at: indexPath) as? StreamingAssistantCell else { continue }
+            cell.apply(streamingDocument(for: id, text: payload.text))
+        }
     }
 
     func setSessionID(_ newSessionID: String?) {
@@ -890,6 +950,9 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
         previousRevisions = [:]
         lastAppliedRevision = -1
         pendingApply = nil
+        revealBuffer.reset()
+        lastRenderedSnapshot = nil
+        updateRevealDisplayLink()
         initialFullPresentation = nil
         isCompletingInitialWindow = false
         initialRenderStartedAt = CACurrentMediaTime()
@@ -903,7 +966,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
 #endif
         cellHeightCache = Self.reusableHeights[reusableHeightKey]?.heights ?? [:]
         reusableReadingAnchor = Self.reusableHeights[reusableHeightKey]?.anchor
-        streamingHeightMeasurers.removeAll(keepingCapacity: true)
+        streamingDocuments.removeAll(keepingCapacity: true)
         pendingLiveHeightCorrections.removeAll(keepingCapacity: true)
         isLiveHeightCorrectionScheduled = false
     }
@@ -959,7 +1022,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
         super.didReceiveMemoryWarning()
         Self.clearReusableHeights()
         cellHeightCache.removeAll()
-        streamingHeightMeasurers.removeAll()
+        streamingDocuments.removeAll()
 #if DEBUG
         warmHostPool?.clear()
 #endif
@@ -1034,7 +1097,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
                 cell.clipsToBounds = true
                 cell.contentView.clipsToBounds = true
                 self.configureStreamingMeasurement(cell, entry: entry)
-                cell.apply(streamingAssistant)
+                cell.apply(self.streamingDocument(for: id, text: streamingAssistant.text))
                 return cell
             }
             if let userMessage = entry.userMessage {
@@ -1388,7 +1451,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
         let activeStreamingIDs = Set(entries.compactMap { entry in
             entry.streamingAssistant == nil ? nil : entry.id
         })
-        streamingHeightMeasurers = streamingHeightMeasurers.filter {
+        streamingDocuments = streamingDocuments.filter {
             activeStreamingIDs.contains($0.key)
         }
         // 图片字节/错误状态只改变绘制内容。把旧宽度下的精确行高交给新内容版本，
@@ -1753,7 +1816,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
                   let indexPath = dataSource.indexPath(for: id),
                   let cell = collectionView.cellForItem(at: indexPath) as? StreamingAssistantCell else { continue }
             configureStreamingMeasurement(cell, entry: entry)
-            cell.apply(payload)
+            cell.apply(streamingDocument(for: id, text: payload.text))
         }
         let invalidatedIndexPaths = ids.compactMap { id -> IndexPath? in
             guard heightChangedIDs.contains(id) else { return nil }
@@ -1835,10 +1898,8 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
 #endif
             let measurement: (height: CGFloat, changed: Bool)
             if let streaming = entry.streamingAssistant {
-                let measurer = streamingHeightMeasurers[entry.id]
-                    ?? StreamingTextHeightMeasurer()
-                streamingHeightMeasurers[entry.id] = measurer
-                measurement = measurer.measure(text: streaming.text, width: width)
+                let document = streamingDocument(for: entry.id, text: streaming.text)
+                measurement = document.measuredHeight(width: width)
             } else {
 #if DEBUG
                 if let pool = warmHostPool, let token = entry.warmHostToken,
@@ -2105,8 +2166,11 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
                     CellMeasurementKey(id: entry.id, revision: entry.revision, width: width)
                 ] = height
             },
-            measureHeight: { width in
-                StreamingAssistantCell.estimatedHeight(for: payload, width: width)
+            measureHeight: { [weak self] width in
+                guard let self else {
+                    return StreamingAssistantCell.estimatedHeight(for: payload, width: width)
+                }
+                return self.streamingDocument(for: entry.id, text: payload.text).height(width: width)
             }
         )
     }
@@ -2769,79 +2833,6 @@ private struct LiveHeightCorrection {
 private struct HeightPrewarmResult {
     var measuredIDs = Set<String>()
     var streamingHeightChangedIDs = Set<String>()
-}
-
-/// Retains TextKit's glyph and line-fragment state across streaming revisions.
-/// Appending a suffix therefore lays out only the newly received text instead
-/// of measuring the entire accumulated response again on every display frame.
-private final class StreamingTextHeightMeasurer {
-    private let textStorage = NSTextStorage()
-    private let layoutManager = NSLayoutManager()
-    private let textContainer = NSTextContainer(
-        size: CGSize(width: 1, height: CGFloat.greatestFiniteMagnitude)
-    )
-    private var measuredText = ""
-    private var measuredWidthInPixels = 0
-    private var measuredFont = UIFont.appPreferredFont(forTextStyle: .body)
-    private var lastHeight: CGFloat?
-
-    init() {
-        textContainer.lineFragmentPadding = 0
-        textContainer.maximumNumberOfLines = 0
-        textContainer.lineBreakMode = .byWordWrapping
-        layoutManager.addTextContainer(textContainer)
-        textStorage.addLayoutManager(layoutManager)
-    }
-
-    func measure(text: String, width: CGFloat) -> (height: CGFloat, changed: Bool) {
-        let availableWidth = max(1, width - 4)
-        let widthInPixels = Int((availableWidth * UIScreen.main.scale).rounded())
-        if widthInPixels != measuredWidthInPixels {
-            measuredWidthInPixels = widthInPixels
-            textContainer.size = CGSize(
-                width: availableWidth,
-                height: CGFloat.greatestFiniteMagnitude
-            )
-        }
-
-        let currentFont = UIFont.appPreferredFont(forTextStyle: .body)
-        if !currentFont.isEqual(measuredFont) {
-            measuredFont = currentFont
-            if textStorage.length > 0 {
-                textStorage.addAttribute(
-                    .font,
-                    value: currentFont,
-                    range: NSRange(location: 0, length: textStorage.length)
-                )
-            }
-        }
-
-        if text != measuredText {
-            if text.hasPrefix(measuredText) {
-                let suffix = String(text.dropFirst(measuredText.count))
-                textStorage.append(attributed(suffix, font: currentFont))
-            } else {
-                textStorage.setAttributedString(attributed(text, font: currentFont))
-            }
-            measuredText = text
-        }
-
-        let textHeight: CGFloat
-        if textStorage.length == 0 {
-            textHeight = 0
-        } else {
-            layoutManager.ensureLayout(for: textContainer)
-            textHeight = ceil(layoutManager.usedRect(for: textContainer).height)
-        }
-        let height = ceil(15 + 26 + 7 + textHeight + 15)
-        let changed = lastHeight.map { abs($0 - height) >= 0.5 } ?? true
-        lastHeight = height
-        return (height, changed)
-    }
-
-    private func attributed(_ text: String, font: UIFont) -> NSAttributedString {
-        NSAttributedString(string: text, attributes: [.font: font])
-    }
 }
 
 private struct CellMeasurementKey: Hashable {
@@ -3780,56 +3771,57 @@ private final class ZoomingImageViewController: UIViewController {
 }
 
 /// The active assistant response is the only row that changes for text
-/// deltas. TextKit appends only the suffix to `NSTextStorage`, preserving all
-/// previously laid-out content. When the response finishes, the row switches
-/// back to the project's existing MarkdownUI renderer.
+/// deltas. Its text view is backed by a shared `StreamingMarkdownDocument`
+/// storage, so only the changed tail is re-laid-out and Markdown is styled while
+/// streaming. When the response finishes, the row switches to the project's
+/// existing MarkdownUI renderer.
 final class StreamingAssistantCell: StableSelfSizingCollectionViewCell {
     static let reuseIdentifier = "StreamingAssistantCell"
 
-    private let textView: UITextView = {
-        let view = UITextView()
-        view.backgroundColor = .clear
-        view.isEditable = false
-        view.isSelectable = false
-        view.isScrollEnabled = false
-        view.textContainerInset = .zero
-        view.textContainer.lineFragmentPadding = 0
-        view.font = .appPreferredFont(forTextStyle: .body)
-        view.textColor = .label
-        view.adjustsFontForContentSizeCategory = false
-        view.translatesAutoresizingMaskIntoConstraints = false
-        view.setContentCompressionResistancePriority(.required, for: .vertical)
-        return view
-    }()
+    private let textView: UITextView
+    private let layoutManager: NSLayoutManager
+    private let placeholderStorage: NSTextStorage
+    private var boundStorage: NSTextStorage
+    private var appliedVersion = -1
+    private weak var appliedDocument: StreamingMarkdownDocument?
+    private var standaloneDocument: StreamingMarkdownDocument?
 
-    private var renderedText = ""
-    var renderedCharacterCount: Int { renderedText.count }
+    /// Length of the source text currently drawn (not the styled output).
+    var renderedCharacterCount: Int { appliedDocument?.currentText.count ?? 0 }
 
     static func estimatedHeight(
         for payload: ConversationViewportEntry.StreamingAssistant,
         width: CGFloat
     ) -> CGFloat {
-        let font = UIFont.appPreferredFont(forTextStyle: .body)
-        let availableWidth = max(1, width - 4)
-        let textHeight: CGFloat
-        if payload.text.isEmpty {
-            textHeight = 0
-        } else {
-            textHeight = ceil((payload.text as NSString).boundingRect(
-                with: CGSize(width: availableWidth, height: .greatestFiniteMagnitude),
-                options: [.usesLineFragmentOrigin, .usesFontLeading],
-                attributes: [.font: font],
-                context: nil
-            ).height)
-        }
-        return ceil(15 + textHeight + 15 + 2)
+        let document = StreamingMarkdownDocument()
+        document.update(text: payload.text, tailFade: 0)
+        return document.height(width: width)
     }
 
     override init(frame: CGRect) {
+        let storage = NSTextStorage()
+        let manager = NSLayoutManager()
+        let container = NSTextContainer(size: CGSize(width: max(1, frame.width), height: .greatestFiniteMagnitude))
+        container.widthTracksTextView = true
+        container.lineFragmentPadding = 0
+        manager.addTextContainer(container)
+        storage.addLayoutManager(manager)
+        placeholderStorage = storage
+        boundStorage = storage
+        layoutManager = manager
+        textView = UITextView(frame: .zero, textContainer: container)
         super.init(frame: frame)
         backgroundColor = .clear
         contentView.backgroundColor = .clear
 
+        textView.backgroundColor = .clear
+        textView.isEditable = false
+        textView.isSelectable = false
+        textView.isScrollEnabled = false
+        textView.textContainerInset = .zero
+        textView.adjustsFontForContentSizeCategory = false
+        textView.translatesAutoresizingMaskIntoConstraints = false
+        textView.setContentCompressionResistancePriority(.required, for: .vertical)
         contentView.addSubview(textView)
 
         NSLayoutConstraint.activate([
@@ -3844,38 +3836,40 @@ final class StreamingAssistantCell: StableSelfSizingCollectionViewCell {
 
     override func prepareForReuse() {
         super.prepareForReuse()
-        renderedText = ""
-        textView.textStorage.setAttributedString(NSAttributedString())
+        bind(to: placeholderStorage)
+        appliedVersion = -1
+        appliedDocument = nil
+        standaloneDocument = nil
+    }
+
+    private func bind(to storage: NSTextStorage) {
+        guard storage !== boundStorage else { return }
+        boundStorage.removeLayoutManager(layoutManager)
+        storage.addLayoutManager(layoutManager)
+        boundStorage = storage
+    }
+
+    /// Convenience for callers that have no controller-owned document.
+    @discardableResult
+    func apply(_ payload: ConversationViewportEntry.StreamingAssistant) -> Bool {
+        let document = standaloneDocument ?? StreamingMarkdownDocument()
+        standaloneDocument = document
+        document.update(text: payload.text, tailFade: 0)
+        return apply(document)
     }
 
     @discardableResult
-    func apply(_ payload: ConversationViewportEntry.StreamingAssistant) -> Bool {
-        let font = UIFont.appPreferredFont(forTextStyle: .body)
-        let fontChanged = textView.font?.isEqual(font) != true
-        guard payload.text != renderedText || fontChanged else { return false }
-        textView.font = font
-
-        if !fontChanged && payload.text.hasPrefix(renderedText) {
-            let suffix = String(payload.text.dropFirst(renderedText.count))
-            textView.textStorage.append(attributed(suffix))
-        } else {
-            textView.textStorage.setAttributedString(attributed(payload.text))
-        }
-        renderedText = payload.text
+    func apply(_ document: StreamingMarkdownDocument) -> Bool {
+        appliedDocument = document
+        let rebound = document.storage !== boundStorage
+        bind(to: document.storage)
+        guard rebound || document.version != appliedVersion else { return false }
+        appliedVersion = document.version
+        textView.setNeedsDisplay()
         textView.setNeedsLayout()
         contentView.setNeedsLayout()
         setNeedsLayout()
         return true
-    }
-
-    private func attributed(_ text: String) -> NSAttributedString {
-        NSAttributedString(
-            string: text,
-            attributes: [
-                .font: UIFont.appPreferredFont(forTextStyle: .body),
-                .foregroundColor: UIColor.label
-            ]
-        )
     }
 }
 

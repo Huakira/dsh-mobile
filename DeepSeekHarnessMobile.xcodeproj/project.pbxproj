@@ -125,8 +125,10 @@
 		F2B000000000000000000001 /* WorkspaceDrawerUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2B000000000000000000002 /* WorkspaceDrawerUITests.swift */; };
 		F5CD0CFD51B8D80944F87550 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BE407E6C6512836EB108990D /* Foundation.framework */; };
 		CF228000000000000000001 /* MarkdownMath.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF228000000000000000002 /* MarkdownMath.swift */; };
+		A0C0FFEE00000000000000A1 /* StreamingMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0C0FFEE00000000000000A2 /* StreamingMarkdown.swift */; };
 		CF228000000000000000003 /* SwiftMath in Frameworks */ = {isa = PBXBuildFile; productRef = CF228000000000000000004 /* SwiftMath */; };
 		CF228000000000000000007 /* MarkdownMathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF228000000000000000008 /* MarkdownMathTests.swift */; };
+		A0C0FFEE00000000000000B1 /* StreamingMarkdownTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0C0FFEE00000000000000B2 /* StreamingMarkdownTests.swift */; };
 		CF229000000000000000001 /* CodeSyntaxHighlighter.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF229000000000000000002 /* CodeSyntaxHighlighter.swift */; };
 		CF229000000000000000003 /* CodeSyntaxHighlighterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF229000000000000000004 /* CodeSyntaxHighlighterTests.swift */; };
 		CF231000000000000000001 /* GatewayNetworkDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF231000000000000000002 /* GatewayNetworkDiagnostics.swift */; };
@@ -293,7 +295,9 @@
 		FCF581253EBCFEB43865AB51 /* Glass.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = Glass.swift; sourceTree = "<group>"; };
 		FEABDA4B6DAF199B320B1BA1 /* MultiGatewayTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MultiGatewayTests.swift; sourceTree = "<group>"; };
 		CF228000000000000000002 /* MarkdownMath.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownMath.swift; sourceTree = "<group>"; };
+		A0C0FFEE00000000000000A2 /* StreamingMarkdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingMarkdown.swift; sourceTree = "<group>"; };
 		CF228000000000000000008 /* MarkdownMathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownMathTests.swift; sourceTree = "<group>"; };
+		A0C0FFEE00000000000000B2 /* StreamingMarkdownTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingMarkdownTests.swift; sourceTree = "<group>"; };
 		CF229000000000000000002 /* CodeSyntaxHighlighter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeSyntaxHighlighter.swift; sourceTree = "<group>"; };
 		CF229000000000000000004 /* CodeSyntaxHighlighterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeSyntaxHighlighterTests.swift; sourceTree = "<group>"; };
 		CF231000000000000000002 /* GatewayNetworkDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayNetworkDiagnostics.swift; sourceTree = "<group>"; };
@@ -420,6 +424,7 @@
 				5D3FFEFFB831B9A6454ECA0E /* AdaptiveLayoutTests.swift */,
 				CF227000000000000000002 /* TrajectoryOverviewLayoutTests.swift */,
 				CF228000000000000000008 /* MarkdownMathTests.swift */,
+				A0C0FFEE00000000000000B2 /* StreamingMarkdownTests.swift */,
 				D5A7E0010000000000000012 /* latex-math.json */,
 				CF229000000000000000004 /* CodeSyntaxHighlighterTests.swift */,
 				CF2030000000000000000002 /* ChatSessionPrefetcherTests.swift */,
@@ -513,6 +518,7 @@
 				CFA110000000000000000002 /* AppleMapsAppCard.swift */,
 				CFA120000000000000000002 /* AppleMusicAppCard.swift */,
 				CF228000000000000000002 /* MarkdownMath.swift */,
+				A0C0FFEE00000000000000A2 /* StreamingMarkdown.swift */,
 				CF229000000000000000002 /* CodeSyntaxHighlighter.swift */,
 				8B77DEC008C0209D814CD7BE /* VoiceRipplePanel.swift */,
 				FCF581253EBCFEB43865AB51 /* Glass.swift */,
@@ -860,6 +866,7 @@
 				EAAE88B94CBECC20963D9646 /* AdaptiveLayoutTests.swift in Sources */,
 				CF227000000000000000001 /* TrajectoryOverviewLayoutTests.swift in Sources */,
 				CF228000000000000000007 /* MarkdownMathTests.swift in Sources */,
+				A0C0FFEE00000000000000B1 /* StreamingMarkdownTests.swift in Sources */,
 				CF229000000000000000003 /* CodeSyntaxHighlighterTests.swift in Sources */,
 				CF2030000000000000000001 /* ChatSessionPrefetcherTests.swift in Sources */,
 				CA11E000000000000000000F /* LocalizationCatalogTests.swift in Sources */,
@@ -927,6 +934,7 @@
 				CFA110000000000000000001 /* AppleMapsAppCard.swift in Sources */,
 				CFA120000000000000000001 /* AppleMusicAppCard.swift in Sources */,
 				CF228000000000000000001 /* MarkdownMath.swift in Sources */,
+				A0C0FFEE00000000000000A1 /* StreamingMarkdown.swift in Sources */,
 				CF229000000000000000001 /* CodeSyntaxHighlighter.swift in Sources */,
 				CF225000000000000000011 /* DocumentPageChrome.swift in Sources */,
 				605DCE79952E970820A95606 /* ConversationView.swift in Sources */,
