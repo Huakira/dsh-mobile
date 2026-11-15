@@ -740,12 +740,16 @@ struct StreamingRevealBuffer {
             }
             live.insert(item.id)
 
-            let dt = min(max(now - track.lastTime, 0), 0.1)
+            let dt = min(max(now - track.lastTime, 0), 0.05)
             track.lastTime = now
             track.shown = min(track.shown, Double(total))
             if advance, track.shown < Double(total) {
                 let backlog = Double(total) - track.shown
-                let step = max(backlog * (1 - exp(-dt * 9)), 45 * dt)
+                // Exponential catch-up, capped by a backlog-scaled rate so one late
+                // frame cannot swallow most of the backlog in a single step.
+                let eased = backlog * (1 - exp(-dt * 9))
+                let cap = max(300, backlog * 3) * dt
+                let step = max(min(eased, cap), 45 * dt)
                 track.shown = min(Double(total), track.shown + step)
             }
 
