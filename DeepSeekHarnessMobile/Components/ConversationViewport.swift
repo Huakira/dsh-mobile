@@ -877,7 +877,8 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
     private func render(_ snapshot: ConversationTimeline.Snapshot, isRevealTick: Bool = false) {
         guard let makeEntries else { return }
         lastRenderedSnapshot = snapshot
-        let items = revealBuffer.smoothed(snapshot.items, now: CACurrentMediaTime(), advance: true)
+        let items = revealBuffer.smoothed(snapshot.items, now: CACurrentMediaTime(), advance: true,
+            isLive: hasAppliedSnapshot)
         streamingTailFade = revealBuffer.tailFade
         if isRevealTick { lastAppliedRevision = -1 }
         updateRevealDisplayLink()

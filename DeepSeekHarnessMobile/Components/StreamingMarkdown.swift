@@ -701,6 +701,10 @@ struct StreamingRevealBuffer {
         var shown: Double
         var lastTime: CFTimeInterval
         var settleUntil: CFTimeInterval
+        /// Full source text last received for this row (not just the drawn
+        /// prefix); a final message under a new id that starts with it is the
+        /// same reply, even if nothing has been drawn yet.
+        var source = ""
     }
 
     private var tracks: [String: Track] = [:]
@@ -713,15 +717,21 @@ struct StreamingRevealBuffer {
         needsTick = false
     }
 
+    /// `isLive` is false for the first snapshot of a freshly opened session:
+    /// rows that are already long then (history reload mid-stream) are shown
+    /// at once. Once the viewport is live, every new streaming row is revealed
+    /// from its first character, however large the first network chunk is.
     mutating func smoothed(
         _ items: [ConversationItem],
         now: CFTimeInterval,
-        advance: Bool
+        advance: Bool,
+        isLive: Bool = false
     ) -> [ConversationItem] {
         var result = items
         var live = Set<String>()
         var needs = false
         var fade: CGFloat = 0
+        let presentIDs = Set(items.map(\.id))
 
         for index in items.indices {
             let item = items[index]
@@ -733,10 +743,16 @@ struct StreamingRevealBuffer {
             var track: Track
             if let existing = tracks[item.id] {
                 track = existing
+            } else if !streaming, let orphan = orphanedTrack(continuedBy: item, presentIDs: presentIDs) {
+                // With assistant-stream-v1 the live row (`live-<attempt>-…`) is
+                // removed when the stream ends and the persisted message is
+                // inserted under a new id (`<session>-<seq>`). Continue the live
+                // row's progress so the rest is revealed instead of popping in.
+                tracks[orphan.id] = nil
+                track = orphan.track
             } else {
                 guard streaming else { continue }
-                // Rows opened mid-stream (history reload) should not replay.
-                track = Track(shown: total > 160 ? Double(total) : 0, lastTime: now, settleUntil: 0)
+                track = Track(shown: !isLive && total > 160 ? Double(total) : 0, lastTime: now, settleUntil: 0)
             }
             live.insert(item.id)
 
@@ -763,8 +779,9 @@ struct StreamingRevealBuffer {
                 continue
             }
 
-            tracks[item.id] = track
             let revealed = String(item.text.prefix(Int(track.shown)))
+            track.source = item.text
+            tracks[item.id] = track
             result[index] = ConversationItem(
                 id: item.id,
                 kind: item.kind,
@@ -786,5 +803,18 @@ struct StreamingRevealBuffer {
         needsTick = needs
         tailFade = fade
         return result
+    }
+
+    /// A track whose row left this snapshot and whose source text is a
+    /// prefix of `item`'s text: the same reply, re-keyed by persistence.
+    private func orphanedTrack(
+        continuedBy item: ConversationItem,
+        presentIDs: Set<String>
+    ) -> (id: String, track: Track)? {
+        tracks
+            .filter { !presentIDs.contains($0.key) && !$0.value.source.isEmpty
+                && item.text.hasPrefix($0.value.source) }
+            .max { $0.value.source.count < $1.value.source.count }
+            .map { ($0.key, $0.value) }
     }
 }

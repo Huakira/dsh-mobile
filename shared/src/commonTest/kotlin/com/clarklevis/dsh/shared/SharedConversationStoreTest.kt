@@ -37,6 +37,30 @@ class SharedConversationStoreTest {
         assertEquals("insert", patch(received.last()).operations.single().kind)
     }
 
+    /** 诊断探针：assistant-stream-v1 的 live 行在持久最终消息到达时是否保持身份。 */
+    @Test
+    fun probeLiveAttemptStreamFinalizationIdentity() {
+        val store = SharedConversationStore()
+        val received = mutableListOf<SharedMviEvent>()
+        store.subscribe(SharedMviEventObserver(received::add))
+        store.receiveEvent(eventJson(1, GatewayEvent("user/message", text = "Hi")))
+        store.receiveEvent(eventJson(2, GatewayEvent("turn/start", turn = 1)))
+        assertTrue(store.assistantChunks("s1", "a1",
+            """[{"time":5,"chunk":{"type":"text-delta","index":0,"text":"Hello"}}]""").accepted)
+        val live = patch(received.last()).operations.single()
+        assertTrue(store.receiveEvent(eventJson(3,
+            GatewayEvent("assistant/message", turn = 1, step = 1, text = "Hello there"))).accepted)
+        val final = patch(received.last()).operations
+        assertTrue(store.clearAssistantChunks("s1").accepted)
+        val cleared = patch(received.last()).operations
+        val summary = "live=${live.kind}:${live.item?.id} final=${final.map { "${it.kind}:${it.itemId ?: it.item?.id}" }} " +
+            "cleared=${cleared.map { "${it.kind}:${it.itemId ?: it.item?.id}" }}"
+        assertEquals("live-a1-text-delta-0", live.item?.id, summary)
+        assertEquals(listOf("insert"), final.map { it.kind }, summary)
+        assertTrue(final.single().item?.id != live.item?.id, summary)
+        assertEquals(listOf("remove:live-a1-text-delta-0"), cleared.map { "${it.kind}:${it.itemId}" }, summary)
+    }
+
     @Test
     fun streamingTextUsesInsertThenDeltaOnlyPatchAndFinalReplacement() {
         val store = SharedConversationStore()
