@@ -510,3 +510,12 @@ Publishing uploads an immutable versioned APK before updating the root `latest.j
 Run `python3 scripts/configure_r2_release.py` to save S3 object read/write credentials for the configured bucket in `~/.config/whaleness/r2-release.json` with permissions `600`. `sh scripts/r2_release.sh --check` only verifies connectivity. `sh scripts/r2_release.sh --prepare <release-directory>` generates a manifest; `--publish <release-directory>` performs the remote publication. The S3 SDK is installed in the isolated `build/r2-tools` environment.
 
 When local configuration exists, the KMM dual-release skill publishes automatically: validate local packages, upload an immutable APK whose filename includes the build number, verify both the remote object and public download, then conditionally update `latest.json`. A failed upload can be retried with the same release directory without rebuilding. Set `R2_UPLOAD=0` for local packaging only. Full upload tests may generate R2 read requests; the initial connection check does not modify remote objects.
+
+## Fork Notes (Huakira)
+
+This repository is a fork of [`Clarklevis1995/dsh-mobile`](https://github.com/Clarklevis1995/dsh-mobile); the `smooth-streaming` branch improves the iOS conversation experience:
+
+- Markdown renders while streaming with a frame-rate–aware typewriter reveal that chases the tail smoothly; a streaming→final row re-key hands the reveal progress over instead of popping the finished answer in.
+- New-turn rows are held for ~2s after sending (the first token is slower anyway), and conversation content is latched per session entry, so the full-screen logo / history-loading overlays can no longer flash back during the new-session handover.
+- Known residual: the streaming (TextKit) renderer and the final MarkdownUI theme still differ in styling on rich blocks (tables, headings); position animates smoothly but the restyle is instant.
+- Building this branch with Xcode 27.0 needs a tiny local, intentionally-uncommitted stub in `WorkspaceView.swift` (upstream uses iOS 27.1 SDK APIs); prebuilt IPAs are attached to this fork's Releases.
