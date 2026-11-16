@@ -2872,6 +2872,15 @@ final class ConversationViewportLayoutTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(200))
         controller.view.layoutIfNeeded()
 
+        // 补充行的 apply 与布局在赛跑：0 section 时读行数会让 UIKit 直接
+        // abort（已三次击穿测试进程）。先轮询等 snapshot 落地再断言。
+        var waitedMilliseconds = 0
+        while collectionView.numberOfSections == 0, waitedMilliseconds < 2000 {
+            try await Task.sleep(for: .milliseconds(20))
+            waitedMilliseconds += 20
+            controller.view.layoutIfNeeded()
+        }
+
         XCTAssertEqual(collectionView.numberOfItems(inSection: 0), 2)
         let process = try XCTUnwrap(
             collectionView.layoutAttributesForItem(at: IndexPath(item: 0, section: 0))?.frame

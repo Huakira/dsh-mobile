@@ -592,6 +592,14 @@ struct ConversationView: View {
     @State private var historyPresentationSessionID: String?
     @State private var viewportHasConversationContent = false
     @State private var viewportContentSessionID: String?
+    // 回复延迟呈现：每次发送后，本回合的助手侧行（思考/流式）等 2s
+    // 再进入 viewport，等大模型首字（通常更慢），避开建会话/换行期的跳出。
+    @State private var replySuppressionDeadline: Date?
+    @State private var replySuppressionAnchorID: String?
+    @State private var replySuppressionViewportWasEmpty = false
+    // 会话交接边界（历史合并、会话清单刷新）会把可见性信号瞬态翻假，
+    // 全屏空态/加载态趁机闪回。内容一旦渲染过就锁存，本次进入不再退回。
+    @State private var contentLatchedSessionID: String?
     @State private var bottomSafeAreaInset: CGFloat = 0
     @State private var additionalKeyboardInset: CGFloat = 0
     @State private var voiceWindowHeight: CGFloat = 0
@@ -748,7 +756,10 @@ struct ConversationView: View {
                         guard sessionID == store.selectedSessionId else { return }
                         viewportContentSessionID = sessionID
                         viewportHasConversationContent = hasContent
-                        if hasContent, let sessionID { store.conversationContentBecameReadable(sessionID: sessionID) }
+                        if hasContent, let sessionID {
+                            contentLatchedSessionID = sessionID
+                            store.conversationContentBecameReadable(sessionID: sessionID)
+                        }
                     }
                 },
                 onPinnedToBottomChanged: { pinned in
@@ -782,23 +793,24 @@ struct ConversationView: View {
             .id(sessionID ?? "__empty__")
             .opacity(shouldShowHistoryPresentationMask ? 0 : 1)
 
-            if !hasVisibleConversationContent, let error = selectedHistoryError {
+            if !isReplySuppressionShowingEmptyViewport && !hasVisibleConversationContent, let error = selectedHistoryError {
                 historyFailureState(error)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(.top, pageTopInset)
                     .padding(.bottom, composerHeight)
                     .readableContentWidth()
                     .zIndex(1)
-            } else if shouldShowHistoryPresentationMask {
+            } else if shouldShowHistoryPresentationMask && !isSuppressingReplyUI {
                 historyPresentationMask
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(.top, pageTopInset)
                     .padding(.bottom, composerHeight)
                     .readableContentWidth()
                     .zIndex(1)
-            } else if !hasVisibleConversationContent {
+            } else if isReplySuppressionShowingEmptyViewport || (!hasVisibleConversationContent && !isConversationContentLatched) {
                 Group {
-                    if isLoadingSelectedHistory { historyLoadingState }
+                    // 抑制窗口内保持空态，历史同步的全屏加载态不插进来。
+                    if isLoadingSelectedHistory && !isSuppressingReplyUI { historyLoadingState }
                     else { emptyState }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1101,6 +1113,8 @@ struct ConversationView: View {
             store.refreshSessionAgentPreset()
             // 每次进入会话先收起历史任务；用户在当前会话手动展开后不会被后续推送重置。
             tasksExpanded = false
+            // 锁存随会话身份重置：重新进入（含恢复流程）后允许遮罩重新走一遍。
+            contentLatchedSessionID = nil
             guard let sessionID = store.selectedSessionId else {
                 historyPresentationSessionID = nil
                 isPreparingHistoryPresentation = false
@@ -1111,7 +1125,9 @@ struct ConversationView: View {
             // Cached content is immediately presentable. A background refresh
             // must never replace it with a full-screen loading mask; the mask
             // is reserved for a genuinely cold session with no local rows.
-            isPreparingHistoryPresentation = isLoadingSelectedHistory && !hasUsableLocalContent
+            // 回复抑制窗口内不进入历史呈现态：新会话首条消息的同步期
+            // 由稳定的空态撑住，内容一次成型，加载全屏不闪现。
+            isPreparingHistoryPresentation = isLoadingSelectedHistory && !hasUsableLocalContent && !isSuppressingReplyUI
             if hasUsableLocalContent {
                 viewportScrollToBottomToken &+= 1
             }
@@ -1154,6 +1170,17 @@ struct ConversationView: View {
     private var isLoadingSelectedHistory: Bool {
         guard let id = store.selectedSessionId else { return false }
         return store.isPreparingConversation(id)
+    }
+
+    private var isConversationContentLatched: Bool {
+        contentLatchedSessionID != nil && contentLatchedSessionID == store.selectedSessionId
+    }
+
+    /// 抑制窗口内 viewport 是否呈现为空（新会话场景：发送时本地还没有任何
+    /// 内容）。此时可见性信号（isRunning / viewport 可用性）正在交接抖动，
+    /// 全屏层必须钉死空态，不允许被信号抖动隐藏又显示——那就是 logo 闪。
+    private var isReplySuppressionShowingEmptyViewport: Bool {
+        isSuppressingReplyUI && replySuppressionViewportWasEmpty
     }
 
     private var isLoadingOlderSelectedHistory: Bool {
@@ -1656,6 +1683,28 @@ struct ConversationView: View {
         }
     }
 
+    private var isSuppressingReplyUI: Bool {
+        guard let deadline = replySuppressionDeadline else { return false }
+        if Date() < deadline { return true }
+        // 新会话场景：2s 后本地仍没有任何内容（回显未到、历史未合并）时
+        // 继续压住，避免 logo 空态页在内容进出的缝隙里闪回。硬顶 4s。
+        return conversationItems.isEmpty && Date().timeIntervalSince(deadline) < 4
+    }
+
+    /// 每次发送都武装 2s 抑制窗口。锚定发送时刻的最后一条 item，
+    /// 之后新增的助手侧行才被压住，历史与上一轮的回答不受影响。
+    private func armReplySuppressionIfNeeded() {
+        guard replySuppressionDeadline == nil else { return }
+        replySuppressionAnchorID = conversationItems.last?.id
+        replySuppressionViewportWasEmpty = conversationItems.isEmpty
+        replySuppressionDeadline = Date().addingTimeInterval(2)
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            replySuppressionDeadline = nil
+            replySuppressionAnchorID = nil
+        }
+    }
+
     private var composerAction: some View {
         Button {
             if showsSessionStopButton {
@@ -1672,6 +1721,7 @@ struct ConversationView: View {
             let content = store.composedSlashMessage(arguments: draft)
             let images = pendingImages
             guard store.send(content, images: images) else { return }
+            armReplySuppressionIfNeeded()
             if store.messageSubmissionPending {
                 submittedQueueDraft = draft
                 submittedQueueImages = images
@@ -2567,7 +2617,23 @@ struct ConversationView: View {
 
     private func makeConversationViewportEntries(from items: [ConversationItem]) -> [ConversationViewportEntry] {
         guard let sessionID = store.selectedSessionId else { return [] }
-        var entries = ConversationDisplayEntry.make(from: items).flatMap { entry in
+        // 抑制窗口内被压住的 item：锚点（发送时刻的最后一条）之后新增的全部行
+        // （用户消息也一并压住，logo 空态页稳定显示到内容一次成型）。
+        var suppressedTailIDs: Set<String> = []
+        if isSuppressingReplyUI {
+            let anchorIndex = replySuppressionAnchorID.flatMap { anchor in items.lastIndex { $0.id == anchor } } ?? -1
+            suppressedTailIDs = Set(items.dropFirst(anchorIndex + 1).map(\.id))
+        }
+        var entries = ConversationDisplayEntry.make(from: items).flatMap { (entry: ConversationDisplayEntry) -> [ConversationViewportEntry] in
+            // 2s 抑制窗口内，本回合的行（消息/流程组）等闸门放行。
+            if !suppressedTailIDs.isEmpty {
+                if case .message(let item) = entry.content, suppressedTailIDs.contains(item.id) {
+                    return []
+                }
+                if case .process(let group) = entry.content, group.items.contains(where: { suppressedTailIDs.contains($0.id) }) {
+                    return []
+                }
+            }
             let revision = viewportEntryRevision(entry)
             if case .message(let item) = entry.content,
                item.kind == .assistant,
@@ -2616,7 +2682,7 @@ struct ConversationView: View {
             }
         }
         // 首屏历史尚未合并时不创建进度占位，避免它提前完成首次贴底定位。
-        if store.selectedSession?.isRunning == true, !items.isEmpty || !isLoadingSelectedHistory {
+        if store.selectedSession?.isRunning == true, !isSuppressingReplyUI, !items.isEmpty || !isLoadingSelectedHistory {
             let timing = store.selectedTurnTiming
             let latestUserIndex = items.lastIndex { $0.kind == .user } ?? -1
             let cues = items.dropFirst(latestUserIndex + 1).compactMap(DeepSearchProgressCue.init)
