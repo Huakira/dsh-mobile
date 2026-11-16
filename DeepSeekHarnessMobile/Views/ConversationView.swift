@@ -1179,9 +1179,12 @@ struct ConversationView: View {
         return (viewportContentSessionID == store.selectedSessionId && viewportHasConversationContent) || !conversationItems.isEmpty
     }
 
+    /// 遮罩必须撑到贴底对齐链收敛（`onBottomAlignmentCompleted`）才撤。
+    /// 首屏自 sizing 的 contentSize 会先偏大，揭开后的 live 高度修正和
+    /// 加载完成时的最终 scrollToBottom 会把内容整体下移；这些移动都发生在
+    /// 内容可用之后，如果按"内容可用"撤遮罩，用户会先看到顶部被裁掉半行。
     private var shouldShowHistoryPresentationMask: Bool {
         isPreparingHistoryPresentation
-            && (viewportContentSessionID != store.selectedSessionId || !viewportHasConversationContent)
     }
 
     private var historyLoadingState: some View {

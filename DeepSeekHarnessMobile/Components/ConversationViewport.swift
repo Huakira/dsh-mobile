@@ -354,6 +354,20 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
     private var isPinnedToBottom = true
     private var hasScrolledFromTop = false
     private var isProgrammaticScroll = false
+    /// Set while a `smoothly` tail-follow animates. Layout passes during the
+    /// animation observe an offset that is still short of the target; letting
+    /// `preservePinnedBottomAfterLayout` act on it would snap and cancel the
+    /// animation. Cleared when the animation ends, the user touches the view,
+    /// or an instant alignment supersedes it.
+    private var isAnimatedTailFollowActive = false
+    /// True between a keep-tail snapshot commit and its finalize. Suppresses
+    /// preservePinnedBottomAfterLayout so the finalize's animated tail follow
+    /// owns the whole move; without this, the apply's layout passes snap the
+    /// offset to the new bottom first and the animated follow becomes a no-op
+    /// (the visible jump when a row is inserted or a cell re-renders taller).
+    private var isTailCommitPending = false
+    /// 贴底差值小于此值时直接贴合，不值得为几 pt 启动一次动画。
+    private static let smoothTailFollowMinimumDelta: CGFloat = 10
     private var isApplyingSnapshot = false
     private var activeSnapshotCommitID: UUID?
     private var nativeHistoryOffsetCommitID: UUID?
@@ -484,6 +498,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
     private var revealBuffer = StreamingRevealBuffer()
     private var lastRenderedSnapshot: ConversationTimeline.Snapshot?
     private var revealDisplayLink: CADisplayLink?
+    private var lastRevealTickTime: CFTimeInterval = 0
     private var streamingTailFade: CGFloat = 0
 
     private final class RevealTickTarget: NSObject {
@@ -742,6 +757,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
     var pendingHistoryRevealIDsForTesting: Set<String> { pendingHistoryRevealIDs }
     var isHistoryPreparationPendingForTesting: Bool { historyHeightPreparation != nil }
     var isHistoryFinalizationPendingForTesting: Bool { pendingPresentationFinalization != nil }
+    var isTailCommitPendingForTesting: Bool { isTailCommitPending }
     var isHistorySnapshotCommitInFlightForTesting: Bool { isApplyingSnapshot }
     var isNativeHistoryOffsetCompensationActiveForTesting: Bool { chatLayout.keepContentOffsetAtBottomOnBatchUpdates }
     var historyDiffableCompletionGateForTesting: ((@escaping () -> Void) -> Void)?
@@ -879,14 +895,23 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
     private func updateRevealDisplayLink() {
         if revealBuffer.needsTick {
             guard revealDisplayLink == nil else { return }
+            lastRevealTickTime = CACurrentMediaTime()
             let target = RevealTickTarget()
             target.owner = self
             let link = CADisplayLink(target: target, selector: #selector(RevealTickTarget.tick))
             link.add(to: .main, forMode: .common)
             revealDisplayLink = link
         } else {
+            let wasChasing = revealDisplayLink != nil
             revealDisplayLink?.invalidate()
             revealDisplayLink = nil
+            // 排水收尾：平滑追随停下来的残余差值（通常只有几个 pt）做一次
+            // 精确贴合，避免顶部切割线停在半行上。
+            if wasChasing, isPinnedToBottom,
+               !collectionView.isTracking, !collectionView.isDragging,
+               !collectionView.isDecelerating, !isViewportMoving {
+                followStreamingTail()
+            }
         }
     }
 
@@ -901,6 +926,35 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
               presentationSchedule.permitsWork(at: CACurrentMediaTime()) else { return }
         render(snapshot, isRevealTick: true)
         refreshStreamingFade()
+        chaseStreamingTail()
+    }
+
+    /// 流式期间的逐帧平滑贴底：reveal 每帧推进文字，offset 以同一节奏
+    /// （exp(-dt*9)）追赶底部目标，替代逐行瞬移。preserve 与逐行即时跟随
+    /// 在 reveal link 存活期间让位给本追随。用户手势/阅读位移时停手。
+    private func chaseStreamingTail() {
+        guard isPinnedToBottom, revealDisplayLink != nil,
+              !collectionView.isTracking, !collectionView.isDragging,
+              !collectionView.isDecelerating, !isViewportMoving,
+              collectionView.bounds.height > 0, hasAppliedSnapshot else {
+            lastRevealTickTime = CACurrentMediaTime()
+            return
+        }
+        let now = CACurrentMediaTime()
+        let dt = max(0, min(now - lastRevealTickTime, 0.1))
+        lastRevealTickTime = now
+        let target = max(-collectionView.adjustedContentInset.top,
+            collectionView.contentSize.height - collectionView.bounds.height
+                + collectionView.adjustedContentInset.bottom)
+        guard target.isFinite else { return }
+        let delta = target - collectionView.contentOffset.y
+        guard abs(delta) > 0.5 else { return }
+        let step = delta * min(1, dt * 9)
+        isProgrammaticScroll = true
+        collectionView.setContentOffset(
+            CGPoint(x: collectionView.contentOffset.x, y: collectionView.contentOffset.y + step),
+            animated: false)
+        isProgrammaticScroll = false
     }
 
     /// Fade decay does not change text (hence no new entry revision), so push
@@ -994,6 +1048,8 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
             pendingPresentationFinalization = nil
             activeSnapshotCommitID = nil
             isApplyingSnapshot = false
+            isTailCommitPending = false
+            chatLayout.keepContentOffsetAtBottomOnBatchUpdates = false
         }
         requiresFreshEntriesAfterDisclosure = false
         cancelHistoryHeightPreparation()
@@ -1217,6 +1273,8 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
     func stopInertialScrolling() {
         needsBottomAlignment = false
         bottomAlignmentGeneration &+= 1
+        isAnimatedTailFollowActive = false
+        isTailCommitPending = false
         guard collectionView.isDecelerating || collectionView.isDragging || isUserGestureAwaitingEnd else { return }
         isProgrammaticScroll = true
         collectionView.setContentOffset(collectionView.contentOffset, animated: false)
@@ -1264,7 +1322,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
         collectionView.verticalScrollIndicatorInsets.bottom = inset
         guard wasPinnedToBottom else { return }
         collectionView.layoutIfNeeded()
-        followStreamingTail()
+        followStreamingTail(smoothly: true)
     }
 
     override func viewWillLayoutSubviews() {
@@ -1296,6 +1354,9 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
     private func preservePinnedBottomAfterLayout() {
         guard hasPlacedInitialPosition, isPinnedToBottom, !isPreservingLayoutBottom,
               !isViewportMoving, !isUserGestureAwaitingEnd,
+              !isAnimatedTailFollowActive, !isTailCommitPending,
+              // 流式 reveal 的逐帧追随负责贴底，布局过程不许逐行瞬移。
+              revealDisplayLink == nil,
               pendingDisclosureAnchor == nil, searchTargetID == nil,
               collectionView.bounds.height > 0, hasAppliedSnapshot else { return }
         let target = max(-collectionView.adjustedContentInset.top,
@@ -1542,8 +1603,12 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
         // retained TextKit measurer invalidates only when the row gains a
         // line. Completed rows remain untouched.
         if !hasStructureChange, configuredChanged.isEmpty {
+            // 逐行 token 增长保持即时贴合：快速流式下动画追逐会让尾部持续
+            // 滞后，把最新内容压到视口之外。平滑跟随只留给离散事件
+            // （行插入、composer 变化、高度修正）。
             if keepTail,
                streamingLayoutChanged,
+               revealDisplayLink == nil,
                userInteractionGeneration == interactionGeneration,
                !collectionView.isTracking,
                !collectionView.isDragging,
@@ -1618,7 +1683,21 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
         let commitDiagnostic = commitDiagnostics.begin(ordinal: metricsLoadOrdinal, rowCount: ids.count, insertedRows: metricsInsertedRows)
         currentCommitDiagnostic = commitDiagnostic
 #endif
-        dataSource.apply(snapshot, animatingDifferences: disclosureAnchor != nil) { [weak self] in
+        // 贴底的结构提交：抑制提交内布局过程的 preserve 瞬移，把整段移动
+        // 交给 finalize 的动画跟随（见 isTailCommitPending 注释）。恢复遮罩
+        // 期间的首次提交不参与——初始定位走 placeInitialPositionIfNeeded。
+        // finalize 可能被推迟（pendingPresentationFinalization），所以标志
+        // 只在 finalize 真正执行或被丢弃时清除。
+        //
+        // live 贴底提交（注入行插入、流式→最终切换）改用 ChatLayout 内置的
+        // 批量更新贴底 + animated diffs：插入点以下/以上的行帧与 offset 在
+        // 同一个动画块里滑动，而不是先瞬移 offset 再补动画。历史批次
+        // （projectionEpoch != nil）保持非动画提交，走原生位置补偿。
+        let animateLiveTailCommit = keepTail && !initialContentRevealPending
+            && disclosureAnchor == nil && batch?.projectionEpoch == nil
+        isTailCommitPending = animateLiveTailCommit
+        chatLayout.keepContentOffsetAtBottomOnBatchUpdates = animateLiveTailCommit
+        dataSource.apply(snapshot, animatingDifferences: disclosureAnchor != nil || animateLiveTailCommit) { [weak self] in
             guard let self else { return }
 #if DEBUG
             commitDiagnostic?.emit(.completionEnter, since: commitDiagnostic?.startedAt)
@@ -1631,6 +1710,10 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
 #endif
             let finalize: () -> Void = { [weak self] in
                 guard let self, self.activeSnapshotCommitID == applyingCommitID else { return }
+                // 覆盖 flushLiveHeightCorrectionsIfNeeded 与动画跟随的整个
+                // 窗口：期间任何布局过程都不允许 preserve 瞬移抢在动画前面。
+                defer { self.isTailCommitPending = false }
+                defer { self.chatLayout.keepContentOffsetAtBottomOnBatchUpdates = false }
                 defer {
                     self.finishNativeHistoryOffsetCompensation(applyingCommitID,
                         reconcilePinnedState: self.sessionGeneration == applyingSessionGeneration)
@@ -1681,7 +1764,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
                       !self.collectionView.isTracking,
                       !self.collectionView.isDragging,
                       !self.collectionView.isDecelerating {
-                self.followStreamingTail()
+                self.followStreamingTail(smoothly: true)
             }
 #if DEBUG
             if prependAnchor != nil {
@@ -2267,7 +2350,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
            !collectionView.isTracking,
            !collectionView.isDragging,
            !collectionView.isDecelerating {
-            followStreamingTail()
+            followStreamingTail(smoothly: true)
         }
     }
 
@@ -2439,13 +2522,28 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
     /// multi-pass stabilizer in `scrollToBottom()` is reserved for initial
     /// history presentation and explicit user requests; running it for every
     /// token competes directly with touch handling and Markdown measurement.
-    private func followStreamingTail() {
+    ///
+    /// `smoothly` animates the offset when the tail moves by more than one
+    /// short hop. A pinned viewport re-pins on every inserted row, live height
+    /// correction, and composer-height change; snapping each of those by the
+    /// full delta is what makes context-injection cards appear as a jump.
+    /// Repeated animated requests supersede the in-flight one, so the tail
+    /// keeps chasing the newest bottom while content keeps growing.
+    private func followStreamingTail(smoothly: Bool = false) {
         guard !dataSource.snapshot().itemIdentifiers.isEmpty else { return }
         collectionView.layoutIfNeeded()
         let bottomOffset = max(
             -collectionView.adjustedContentInset.top,
             collectionView.contentSize.height - collectionView.bounds.height + collectionView.adjustedContentInset.bottom
         )
+        if smoothly, !isApplyingSnapshot,
+           abs(bottomOffset - collectionView.contentOffset.y) > Self.smoothTailFollowMinimumDelta {
+            isAnimatedTailFollowActive = true
+            collectionView.setContentOffset(CGPoint(x: 0, y: bottomOffset), animated: true)
+            setPinned(true)
+            return
+        }
+        isAnimatedTailFollowActive = false
         isProgrammaticScroll = true
         collectionView.setContentOffset(CGPoint(x: 0, y: bottomOffset), animated: false)
         isProgrammaticScroll = false
@@ -2508,6 +2606,8 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
         guard !dataSource.snapshot().itemIdentifiers.isEmpty,
               collectionView.bounds.height > 0 else { return }
         needsBottomAlignment = false
+        // 即时贴底是权威对齐，取代任何还在飞行的平滑跟随。
+        isAnimatedTailFollowActive = false
         isProgrammaticScroll = true
         collectionView.collectionViewLayout.invalidateLayout()
         collectionView.layoutIfNeeded()
@@ -2571,6 +2671,7 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
         historyScrollMetrics?.scrollBegan(rowCount: historyMetricsRowCount)
 #endif
         // User interaction wins immediately over automatic tail following.
+        isAnimatedTailFollowActive = false
         revealInsertedHistoryImmediately()
         pauseStreamingRenderingForUserScroll()
         needsBottomAlignment = false
@@ -2597,6 +2698,10 @@ final class ConversationViewportController: UIViewController, UICollectionViewDe
 #endif
         updatePinnedState(for: scrollView, userFinished: true)
         resumeStreamingRenderingAfterUserScroll()
+    }
+
+    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        isAnimatedTailFollowActive = false
     }
 
     private func pauseStreamingRenderingForUserScroll() {

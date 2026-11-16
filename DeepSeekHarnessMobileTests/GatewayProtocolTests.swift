@@ -1737,6 +1737,165 @@ final class ConversationViewportLayoutTests: XCTestCase {
         }
         XCTAssertTrue(condition(), "会话布局未在超时前稳定", file: file, line: line)
     }
+
+    /// 贴底时的结构提交（新行插入）不允许 preservePinnedBottomAfterLayout
+    /// 在 apply 的布局过程里瞬移 offset：整段移动必须交给 finalize 的动画
+    /// 跟随。回归背景：流式→最终渲染切换、上下文注入行出现时的可见跳动。
+    @MainActor
+    func testTailCommitDoesNotSnapDuringApplyAndFollowsTailSmoothly() async throws {
+        ConversationViewportController.clearReusableHeights()
+        defer { ConversationViewportController.clearReusableHeights() }
+        let controller = ConversationViewportController(onContentAvailabilityChanged: { _, _ in },
+            onPinnedToBottomChanged: { _ in }, onBottomAlignmentCompleted: {}, onApproachingTop: {})
+        controller.loadViewIfNeeded()
+        controller.view.frame = CGRect(x: 0, y: 0, width: 390, height: 320)
+        controller.view.layoutIfNeeded()
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.frame = controller.view.frame
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil; previous?.makeKeyAndVisible() }
+
+        let timeline = ConversationTimeline()
+        func item(_ id: String) -> ConversationItem {
+            ConversationItem(id: id, kind: .assistant, title: "DeepSeek", text: "", isError: false,
+                date: Date(timeIntervalSince1970: 1))
+        }
+        controller.configure(
+            sessionID: "tail-commit-suppression",
+            timeline: timeline,
+            supplementalEntries: [],
+            makeEntries: { items in
+                items.map { item in
+                    let height: CGFloat = item.id == "row-tail" ? 400 : 120
+                    return ConversationViewportEntry(id: item.id, revision: 1,
+                        content: AnyView(Color.clear.frame(height: height)))
+                }
+            },
+            bottomInset: 0
+        )
+        timeline.publish((0..<6).map { item("row-\($0)") })
+        let list = try XCTUnwrap(firstDescendant(of: UICollectionView.self, in: controller.view))
+        try await waitForLayout { !controller.isTailCommitPendingForTesting }
+        try await waitForLayout {
+            abs(list.contentOffset.y - (list.contentSize.height - list.bounds.height
+                + list.adjustedContentInset.bottom)) < 2
+        }
+
+        // 卡住 finalize，在提交布局完成后、动画跟随前采样。
+        let gated = expectation(description: "commit laid out, finalization gated")
+        var release: (() -> Void)?
+        var pendingAtGate = false
+        controller.historyDiffableCompletionGateForTesting = { completion in
+            controller.historyDiffableCompletionGateForTesting = nil
+            pendingAtGate = controller.isTailCommitPendingForTesting
+            release = completion
+            gated.fulfill()
+        }
+        defer { controller.historyDiffableCompletionGateForTesting = nil }
+
+        timeline.publish((0..<6).map { item("row-\($0)") } + [item("row-tail")])
+        await fulfillment(of: [gated], timeout: 4)
+        // live 贴底提交走 ChatLayout 批量更新贴底 + animated diffs：提交期间
+        // 底部锚定开启、preserve 被抑制，收尾后收敛到新底部。
+        XCTAssertTrue(pendingAtGate, "keepTail 提交期间应抑制 preserve")
+        XCTAssertTrue(controller.isNativeHistoryOffsetCompensationActiveForTesting,
+            "批量更新贴底应在提交窗口内保持开启")
+        try XCTUnwrap(release)()
+        // 动画跟随完成后收敛到新底部。
+        try await waitForLayout {
+            abs(list.contentOffset.y - (list.contentSize.height - list.bounds.height
+                + list.adjustedContentInset.bottom)) < 2
+        }
+        try await waitForLayout { !controller.isTailCommitPendingForTesting }
+        XCTAssertFalse(controller.isTailCommitPendingForTesting)
+        XCTAssertFalse(controller.isNativeHistoryOffsetCompensationActiveForTesting)
+    }
+
+    /// 中段插入（注入行出现在已存在的流式回复行之前）时，插入点以下的行
+    /// 是否发生瞬时位移——这是用户看到的"跳跃"候选机制。测量性测试。
+    @MainActor
+    func testMidTailInsertDisplacesStreamingRowInstantly() async throws {
+        ConversationViewportController.clearReusableHeights()
+        defer { ConversationViewportController.clearReusableHeights() }
+        let controller = ConversationViewportController(onContentAvailabilityChanged: { _, _ in },
+            onPinnedToBottomChanged: { _ in }, onBottomAlignmentCompleted: {}, onApproachingTop: {})
+        controller.loadViewIfNeeded()
+        controller.view.frame = CGRect(x: 0, y: 0, width: 390, height: 320)
+        controller.view.layoutIfNeeded()
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.frame = controller.view.frame
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil; previous?.makeKeyAndVisible() }
+
+        let timeline = ConversationTimeline()
+        func item(_ id: String, _ kind: ConversationItem.Kind) -> ConversationItem {
+            ConversationItem(id: id, kind: kind, title: "DeepSeek", text: "", isError: false,
+                date: Date(timeIntervalSince1970: 1))
+        }
+        controller.configure(
+            sessionID: "mid-tail-insert",
+            timeline: timeline,
+            supplementalEntries: [],
+            makeEntries: { items in
+                items.map { item in
+                    let height: CGFloat = item.id == "row-assistant" ? 400
+                        : item.id == "row-context" ? 150 : 120
+                    return ConversationViewportEntry(id: item.id, revision: 1,
+                        content: AnyView(Color.clear.frame(height: height)))
+                }
+            },
+            bottomInset: 0
+        )
+        timeline.publish([item("row-user", .user), item("row-assistant", .assistant)])
+        let list = try XCTUnwrap(firstDescendant(of: UICollectionView.self, in: controller.view))
+        try await waitForLayout { !controller.isTailCommitPendingForTesting }
+        try await waitForLayout {
+            abs(list.contentOffset.y - (list.contentSize.height - list.bounds.height
+                + list.adjustedContentInset.bottom)) < 2
+        }
+        func frameMinY(_ id: String) -> CGFloat {
+            guard let path = dataSourcePath(list, id) else { return -1 }
+            return list.layoutAttributesForItem(at: path)?.frame.minY ?? -1
+        }
+        func dataSourcePath(_ list: UICollectionView, _ id: String) -> IndexPath? {
+            let source = list.dataSource as? UICollectionViewDiffableDataSource<Int, String>
+            guard let source, let index = source.snapshot().itemIdentifiers.firstIndex(of: id) else { return nil }
+            return IndexPath(item: index, section: 0)
+        }
+        let assistantMinYBefore = frameMinY("row-assistant")
+
+        // 注入行插在 user 行与 assistant 行之间（真实动线：上下文随 turn 到达）。
+        let gated = expectation(description: "commit laid out, finalization gated")
+        var release: (() -> Void)?
+        var assistantMinYAtGate: CGFloat = -1
+        var offsetAtGate: CGFloat = -1
+        var pendingAtGate = false
+        controller.historyDiffableCompletionGateForTesting = { completion in
+            controller.historyDiffableCompletionGateForTesting = nil
+            assistantMinYAtGate = frameMinY("row-assistant")
+            offsetAtGate = list.contentOffset.y
+            pendingAtGate = controller.isTailCommitPendingForTesting
+            release = completion
+            gated.fulfill()
+        }
+        defer { controller.historyDiffableCompletionGateForTesting = nil }
+
+        timeline.publish([item("row-user", .user), item("row-context", .context), item("row-assistant", .assistant)])
+        await fulfillment(of: [gated], timeout: 4)
+        print("MIDTAIL measure: assistantY before=\(assistantMinYBefore) atGate=\(assistantMinYAtGate) offsetAtGate=\(offsetAtGate) pending=\(pendingAtGate) targetAtGate=\(list.contentSize.height - list.bounds.height + list.adjustedContentInset.bottom)")
+        try XCTUnwrap(release)()
+        try await waitForLayout {
+            abs(list.contentOffset.y - (list.contentSize.height - list.bounds.height
+                + list.adjustedContentInset.bottom)) < 2
+        }
+        print("MIDTAIL final: assistantY=\(frameMinY("row-assistant")) offset=\(list.contentOffset.y)")
+    }
     @MainActor
     func testWarmSessionRestoresReadingAnchorAndSearchDoesNotSnapBackToTail() async throws {
         ConversationViewportController.clearReusableHeights()
